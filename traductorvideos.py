@@ -33,9 +33,10 @@ def upload_form():
             </script>
         </head>
         <body>
-            <h1>Sube tu video para traducir</h1>
+            <h1>Sube tu video y música para traducir</h1>
             <form id="upload-form" action="/translate" method="post" enctype="multipart/form-data" onsubmit="updateProgress();">
                 <input type="file" name="video" accept="video/*" required>
+                <input type="file" name="music" accept="audio/mp3" required>
                 <input type="submit" value="Traducir">
             </form>
             <div style="width: 100%; background-color: #f3f3f3;">
@@ -57,8 +58,11 @@ def translate_video():
     progress_value = 0  # Reiniciar el progreso
 
     video_file = request.files['video']
+    music_file = request.files['music']  # Obtener el archivo de música
     video_path = 'uploaded_video.mp4'
+    music_path = 'background_music.mp3'  # Ruta para guardar la música
     video_file.save(video_path)
+    music_file.save(music_path)  # Guardar el archivo de música
 
     # Extraer audio como OGG
     progress_value = 25  # 25% después de extraer audio
@@ -99,25 +103,35 @@ def translate_video():
     translator = Translator()
     translated_text = translator.translate(text, dest='es').text  # Cambia 'es' por el idioma deseado
 
-        # Generar audio TTS
+    # Generar audio TTS
     tts = gTTS(translated_text, lang='es')  # Cambia 'es' por el idioma deseado
     tts_path = 'translated_audio.mp3'
     tts.save(tts_path)
 
     # Combinar el video original con el nuevo audio
     progress_value = 100  # 100% al finalizar
-    final_video_path = 'final_video.mp4'
 
-    original_video = VideoFileClip(video_path)
-    translated_audio = AudioFileClip(tts_path)
+    # Cargar la música de fondo y ajustar el volumen
+    background_music = AudioSegment.from_mp3(music_path)
+    background_music = background_music - 20  # Reducir el volumen al 30% (aproximadamente -20 dB)
 
-    # Ajustar la duración del audio al video
-    if translated_audio.duration < original_video.duration:
-        silence_duration = original_video.duration - translated_audio.duration
+    # Crear fade out en la música de fondo
+    fade_duration = 3000  # Duración del fade out en milisegundos (3 segundos)
+    background_music = background_music.fade_out(fade_duration)
+
+    # Cargar el audio traducido
+    translated_audio = AudioSegment.from_file(tts_path)
+
+    # Ajustar la duración del audio traducido al video
+    if translated_audio.duration_seconds < video.duration:
+        silence_duration = video.duration - translated_audio.duration_seconds
         silence = AudioSegment.silent(duration=silence_duration * 1000)  # Convertir a milisegundos
-        final_audio_segment = AudioSegment.from_file(tts_path) + silence
+        final_audio_segment = translated_audio + silence
     else:
-        final_audio_segment = translated_audio.set_duration(original_video.duration)
+        final_audio_segment = translated_audio.set_duration(video.duration)
+
+    # Combinar el audio traducido con la música de fondo
+    final_audio_segment = final_audio_segment.overlay(background_music)
 
     # Exportar el audio final a un archivo temporal
     final_audio_path = 'final_audio.mp3'
@@ -126,10 +140,11 @@ def translate_video():
     # Cargar el audio final como AudioFileClip
     final_audio = AudioFileClip(final_audio_path)
 
-    # Crear el nuevo video con el audio traducido
-    final_video = original_video.set_audio(final_audio)
+    # Crear el nuevo video con el audio traducido y la música de fondo
+    final_video = video.set_audio(final_audio)
 
     try:
+        final_video_path = 'final_video.mp4'
         final_video.write_videofile(final_video_path, codec='libx264', audio_codec='aac')
     except Exception as e:
         return f"Error al escribir el video final: {str(e)}", 500
@@ -139,6 +154,7 @@ def translate_video():
     os.remove(audio_path)
     os.remove(wav_path)
     os.remove(tts_path)
+    os.remove(music_path)  # Eliminar el archivo de música
     os.remove(final_audio_path)  # Eliminar el archivo de audio final
 
     return send_file(final_video_path, as_attachment=True)
