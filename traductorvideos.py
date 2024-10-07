@@ -1,16 +1,77 @@
 import os
-import time
-from flask import Flask, request, jsonify, send_file
-from moviepy.editor import VideoFileClip, AudioFileClip
-import speech_recognition as sr
+import logging
+from flask import Flask, request, send_file
+from moviepy.editor import VideoFileClip, AudioFileClip, concatenate_videoclips, concatenate_audioclips, CompositeAudioClip
 from gtts import gTTS
 from pydub import AudioSegment
+import speech_recognition as sr
 from googletrans import Translator
+import tempfile
+import shutil
+
+# Configurar logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# Variable global para el progreso
-progress_value = 0
+def process_segment(video_clip, start_time, duration, translator, segment_index):
+    logger.info(f"Procesando segmento {segment_index}: {start_time}-{start_time + duration}")
+    retries = 3  # Número de reintentos
+    for attempt in range(retries):
+        try:
+            # Extraer segmento de video
+            segment = video_clip.subclip(start_time, start_time + duration)
+
+            # Extraer y guardar audio del segmento
+            temp_audio_path = tempfile.mktemp(suffix='.wav')
+            segment.audio.write_audiofile(temp_audio_path, fps=44100, logger=None)
+
+            # Transcribir audio
+            recognizer = sr.Recognizer()
+            with sr.AudioFile(temp_audio_path) as source:
+                audio_data = recognizer.record(source)
+                text = recognizer.recognize_google(audio_data, language='en-US')
+                logger.info(f"Segmento {segment_index} transcrito: {text[:50]}...")
+
+            # Traducir texto
+            if text.strip():
+                translated_text = translator.translate(text, dest='es').text
+                logger.info(f"Segmento {segment_index} traducido: {translated_text[:50]}...")
+                
+                # Generar audio traducido
+                tts_path = tempfile.mktemp(suffix='.mp3')
+                tts = gTTS(translated_text, lang='es')
+                tts.save(tts_path)
+
+                # Ajustar duración del audio traducido
+                translated_audio = AudioSegment.from_mp3(tts_path)
+                original_duration = duration * 1000  # convertir a milisegundos
+
+                if len(translated_audio) < original_duration:
+                    silence = AudioSegment.silent(duration=original_duration - len(translated_audio))
+                    translated_audio = translated_audio + silence
+                elif len(translated_audio) > original_duration:
+                    translated_audio = translated_audio[:original_duration]
+
+                translated_audio.export(tts_path, format='mp3')
+
+                # Crear nuevo clip de video con audio traducido
+                new_audio = AudioFileClip(tts_path)
+                new_segment = segment.set_audio(new_audio)
+
+                # Limpiar archivos temporales
+                os.remove(tts_path)
+                os.remove(temp_audio_path)
+                return new_segment
+            else:
+                logger.warning(f"Usando audio original para segmento {segment_index}")
+                return segment  # Si no hay texto, devolvemos el segmento original
+        except Exception as e:
+            logger.error(f"Error en el intento {attempt + 1} para el segmento {segment_index}: {e}")
+            if attempt == retries - 1:  # Último intento fallido
+                logger.warning(f"Falló el procesamiento del segmento {segment_index} después de {retries} intentos.")
+                return segment  # Regresamos el segmento original en caso de fallo
 
 @app.route('/')
 def upload_form():
@@ -18,146 +79,134 @@ def upload_form():
     <html>
         <head>
             <title>Traductor de Video</title>
+            <style>
+                body { font-family: Arial, sans-serif; margin: 20px; }
+                .progress { display: none; margin-top: 20px; }
+                .progress-bar {
+                    width: 100%;
+                    background-color: #f0f0f0;
+                    padding: 3px;
+                    border-radius: 3px;
+                    box-shadow: inset 0 1px 3px rgba(0, 0, 0, .2);
+                }
+                .progress-bar-fill {
+                    display: block;
+                    height: 22px;
+                    background-color: #659cef;
+                    border-radius: 3px;
+                    transition: width 500ms ease-in-out;
+                }
+            </style>
             <script>
-                function updateProgress() {
-                    fetch('/progress')
-                        .then(response => response.json())
-                        .then(data => {
-                            document.getElementById('progress').style.width = data.progress + '%';
-                            document.getElementById('progress-text').innerText = data.progress + '%';
-                            if (data.progress < 100) {
-                                setTimeout(updateProgress, 1000);
-                            }
-                        });
+                function showProgress() {
+                    document.querySelector('.progress').style.display = 'block';
+                    return true;
                 }
             </script>
         </head>
         <body>
-            <h1>Sube tu video y música para traducir</h1>
-            <form id="upload-form" action="/translate" method="post" enctype="multipart/form-data" onsubmit="updateProgress();">
-                <input type="file" name="video" accept="video/*" required>
-                <input type="file" name="music" accept="audio/mp3" required>
-                <input type="submit" value="Traducir">
+            <h1>Traductor de Video</h1>
+            <form action="/translate" method="post" enctype="multipart/form-data" onsubmit="return showProgress()">
+                <div>
+                    <label for="video">Selecciona el video:</label><br>
+                    <input type="file" id="video" name="video" accept="video/*" required>
+                </div>
+                <div style="margin-top: 10px;">
+                    <label for="music">Selecciona la música de fondo:</label><br>
+                    <input type="file" id="music" name="music" accept="audio/*" required>
+                </div>
+                <div style="margin-top: 20px;">
+                    <input type="submit" value="Traducir Video">
+                </div>
             </form>
-            <div style="width: 100%; background-color: #f3f3f3;">
-                <div id="progress" style="width: 0%; height: 30px; background-color: #4caf50;"></div>
+            <div class="progress">
+                <p>Procesando video... Esto puede tardar varios minutos.</p>
+                <div class="progress-bar">
+                    <span class="progress-bar-fill" style="width: 0%"></span>
+                </div>
             </div>
-            <div id="progress-text">0%</div>
         </body>
     </html>
     '''
 
-@app.route('/progress')
-def progress():
-    global progress_value
-    return jsonify(progress=progress_value)
-
 @app.route('/translate', methods=['POST'])
 def translate_video():
-    global progress_value
-    progress_value = 0  # Reiniciar el progreso
+    if 'video' not in request.files or 'music' not in request.files:
+        return 'No se encontraron archivos', 400
 
     video_file = request.files['video']
-    music_file = request.files['music']  # Obtener el archivo de música
-    video_path = 'uploaded_video.mp4'
-    music_path = 'background_music.mp3'  # Ruta para guardar la música
-    video_file.save(video_path)
-    music_file.save(music_path)  # Guardar el archivo de música
+    music_file = request.files['music']
 
-    # Extraer audio como OGG
-    progress_value = 25  # 25% después de extraer audio
-    time.sleep(1)  # Simular tiempo de procesamiento
-    video = VideoFileClip(video_path)
-    audio_path = 'audio.ogg'  # Guardar como OGG
-    video.audio.write_audiofile(audio_path, codec='libvorbis')  # Usar OGG
-
-    # Convertir OGG a WAV
-    progress_value = 50  # 50% después de convertir audio
-    time.sleep(1)  # Simular tiempo de procesamiento
-    audio_segment = AudioSegment.from_ogg(audio_path)
-    wav_path = 'audio.wav'
-    audio_segment.export(wav_path, format='wav')
-
-    # Verificar si el archivo WAV se creó correctamente
-    if not os.path.exists(wav_path) or os.path.getsize(wav_path) == 0:
-        return "Error: El archivo de audio no se creó correctamente.", 500
-
-    # Reconocer el audio
-    recognizer = sr.Recognizer()
+    # Crear directorio temporal
+    temp_dir = tempfile.mkdtemp()
     try:
-        with sr.AudioFile(wav_path) as source:
-            audio = recognizer.record(source)
-            text = recognizer.recognize_google(audio, language='en-US')
-    except sr.UnknownValueError:
-        return "Error: No se pudo entender el audio.", 500
-    except sr.RequestError as e:
-        return f"Error al conectar con el servicio de reconocimiento de voz: {str(e)}", 500
+        # Guardar archivos
+        video_path = os.path.join(temp_dir, 'input_video.mp4')
+        music_path = os.path.join(temp_dir, 'background_music.mp3')
+        video_file.save(video_path)
+        music_file.save(music_path)
+
+        # Cargar video y crear traductor
+        video = VideoFileClip(video_path)
+        translator = Translator()
+
+        # Procesar video en segmentos
+        segment_duration = 20  # Reducido a 20 segundos para mejor manejo
+        processed_segments = []
+
+        for i, start_time in enumerate(range(0, int(video.duration), segment_duration)):
+            end_time = min(start_time + segment_duration, video.duration)
+            segment_duration_actual = end_time - start_time
+            
+            processed_segment = process_segment(video, start_time, segment_duration_actual, translator, i)
+            processed_segments.append(processed_segment)
+
+        logger.info(f"Procesados {len(processed_segments)} segmentos")
+
+        # Unir segmentos
+        final_video = concatenate_videoclips(processed_segments)
+
+        # Manejar la música de fondo
+        background_music = AudioFileClip(music_path)
+
+        # Si la música es más corta que el video, la repetimos
+        if background_music.duration < final_video.duration:
+            repeats = int(final_video.duration / background_music.duration) + 1
+            music_segments = [background_music] * repeats
+            extended_music = concatenate_audioclips(music_segments)
+            background_music = extended_music.subclip(0, final_video.duration)
+        else:
+            background_music = background_music.subclip(0, final_video.duration)
+
+        # Reducir volumen de la música
+        background_music = background_music.volumex(0.1)
+
+        # Asegurarse de que el video final tenga audio
+        if hasattr(final_video, 'audio') and final_video.audio is not None:
+            final_audio = CompositeAudioClip([final_video.audio, background_music])
+        else:
+            logger.warning("El video final no tiene audio, usando solo música de fondo")
+            final_audio = background_music
+
+        final_video = final_video.set_audio(final_audio)
+
+        # Guardar video final
+        output_path = os.path.join(temp_dir, 'video_traducido.mp4')
+        final_video.write_videofile(output_path, 
+                                   codec='libx264', 
+                                   audio_codec='aac', 
+                                   audio_bitrate='192k',
+                                   logger=None)
+
+        return send_file(output_path, as_attachment=True)
+
     except Exception as e:
-        return f"Error en el reconocimiento de voz: {str(e)}", 500
+        logger.error(f"Error durante el procesamiento del video: {e}")
+        return 'Error procesando el video', 500
 
-    # Verificar que se haya reconocido texto
-    if not text.strip():
-        return "Error: No se reconoció ningún texto en el audio.", 500
-
-    # Traducir el texto
-    translator = Translator()
-    translated_text = translator.translate(text, dest='es').text  # Cambia 'es' por el idioma deseado
-
-    # Generar audio TTS
-    tts = gTTS(translated_text, lang='es')  # Cambia 'es' por el idioma deseado
-    tts_path = 'translated_audio.mp3'
-    tts.save(tts_path)
-
-    # Combinar el video original con el nuevo audio
-    progress_value = 100  # 100% al finalizar
-
-    # Cargar la música de fondo y ajustar el volumen
-    background_music = AudioSegment.from_mp3(music_path)
-    background_music = background_music - 20  # Reducir el volumen al 30% (aproximadamente -20 dB)
-
-    # Crear fade out en la música de fondo
-    fade_duration = 3000  # Duración del fade out en milisegundos (3 segundos)
-    background_music = background_music.fade_out(fade_duration)
-
-    # Cargar el audio traducido
-    translated_audio = AudioSegment.from_file(tts_path)
-
-    # Ajustar la duración del audio traducido al video
-    if translated_audio.duration_seconds < video.duration:
-        silence_duration = video.duration - translated_audio.duration_seconds
-        silence = AudioSegment.silent(duration=silence_duration * 1000)  # Convertir a milisegundos
-        final_audio_segment = translated_audio + silence
-    else:
-        final_audio_segment = translated_audio.set_duration(video.duration)
-
-    # Combinar el audio traducido con la música de fondo
-    final_audio_segment = final_audio_segment.overlay(background_music)
-
-    # Exportar el audio final a un archivo temporal
-    final_audio_path = 'final_audio.mp3'
-    final_audio_segment.export(final_audio_path, format='mp3')
-
-    # Cargar el audio final como AudioFileClip
-    final_audio = AudioFileClip(final_audio_path)
-
-    # Crear el nuevo video con el audio traducido y la música de fondo
-    final_video = video.set_audio(final_audio)
-
-    try:
-        final_video_path = 'final_video.mp4'
-        final_video.write_videofile(final_video_path, codec='libx264', audio_codec='aac')
-    except Exception as e:
-        return f"Error al escribir el video final: {str(e)}", 500
-
-    # Limpiar archivos temporales
-    os.remove(video_path)
-    os.remove(audio_path)
-    os.remove(wav_path)
-    os.remove(tts_path)
-    os.remove(music_path)  # Eliminar el archivo de música
-    os.remove(final_audio_path)  # Eliminar el archivo de audio final
-
-    return send_file(final_video_path, as_attachment=True)
+    finally:
+        # Limpiar archivos temporales
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 if __name__ == '__main__':
     app.run(debug=True)
